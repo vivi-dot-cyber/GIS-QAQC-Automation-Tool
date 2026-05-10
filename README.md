@@ -1,17 +1,5 @@
 # GIS-QAQC-Automation-Tool
 Python-based QA/QC automation tool for ArcGIS Pro that cleans point and line datasets, enforces boundary constraints, and generates detailed error logs.
-
-# GIS-QAQC-Automation-Tool/
-│
-├── README.md
-├── qaqc_tool.py
-├── toolbox.tbx  (optional if you include your script tool)
-├── sample_data/
-│     ├── points.gdb
-│     ├── lines.gdb
-│     └── boundary.gdb
-├── project_writeup.pdf
-
 This project automates QA/QC for point and polyline datasets in ArcGIS Pro. It removes points outside a boundary, clips and extends lines to boundary edges, fixes common geometry issues, and generates a detailed error log. Designed for flexible use with adjustable tolerances and optional boundary enforcement
 
 # Features
