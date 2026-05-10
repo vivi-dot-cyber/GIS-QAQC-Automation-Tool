@@ -1,0 +1,156 @@
+#---------------------------------------------------------------------------------------
+# Name:        QA/QC + Correction Tool for Points and Lines
+#
+# Author:      Vivian Werth
+#
+# Created:     25/04/2026
+# Copyright:   (c) vivia 2026
+#---------------------------------------------------------------------------------------
+
+import arcpy
+import csv
+import os
+
+def write_error_log(errors, out_folder, log_format="CSV"):
+    log_path = os.path.join(out_folder, f"QAQC_ErrorLog.{log_format.lower()}")
+    fields = ["OID", "Error", "Field", "Action"]
+
+    if log_format.upper() == "CSV":
+        with open(log_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(errors)
+    else:
+        with open(log_path, "w") as f:
+            for e in errors:
+                f.write(f"OBJECTID {e['OID']}: {e['Error']} | {e['Action']}\n")
+
+    return log_path
+
+
+# POINT FIXES — REMOVE ONLY POINTS OUTSIDE BOUNDARY
+def fix_points(input_fc, out_fc, errors, boundary_fc=None):
+
+    if not boundary_fc:
+        arcpy.CopyFeatures_management(input_fc, out_fc)
+        return out_fc, errors
+
+    # Select points inside boundary
+    arcpy.MakeFeatureLayer_management(input_fc, "points_lyr")
+    arcpy.SelectLayerByLocation_management("points_lyr", "WITHIN", boundary_fc)
+
+    # Copy selected points to output
+    arcpy.CopyFeatures_management("points_lyr", out_fc)
+
+    # Log removed points
+    inside_oids = {row[0] for row in arcpy.da.SearchCursor(out_fc, ["OID@"])}
+    all_oids = {row[0] for row in arcpy.da.SearchCursor(input_fc, ["OID@"])}
+    removed = all_oids - inside_oids
+
+    for oid in removed:
+        errors.append({"OID": oid, "Error": "Outside boundary", "Field": "Shape", "Action": "Removed"})
+
+    return out_fc, errors
+
+
+# LINE FIXES — CLIP OUTSIDE + EXTEND TO BOUNDARY
+def fix_lines(input_fc, out_fc, errors, snap_tol, trim_tol, extend_tol, boundary_fc=None):
+    arcpy.CopyFeatures_management(input_fc, out_fc)
+
+    # Clip lines to boundary
+    if boundary_fc:
+        clipped_fc = os.path.join(os.path.dirname(out_fc), "Lines_Clipped")
+        try:
+            arcpy.Clip_analysis(out_fc, boundary_fc, clipped_fc)
+            out_fc = clipped_fc
+            errors.append({"OID": "ALL", "Error": "Lines crossing boundary", "Field": "Shape", "Action": "Clipped"})
+        except Exception as e:
+            errors.append({"OID": "ALL", "Error": f"Clip failed: {e}", "Field": "Shape", "Action": "Unfixed"})
+
+    # Convert boundary polygon to line features for extension
+    boundary_lines = None
+    if boundary_fc:
+        boundary_lines = os.path.join(os.path.dirname(out_fc), "BoundaryLines")
+        try:
+            arcpy.PolygonToLine_management(boundary_fc, boundary_lines)
+        except Exception as e:
+            errors.append({"OID": "ALL", "Error": f"PolygonToLine failed: {e}", "Field": "Shape", "Action": "Unfixed"})
+
+    # Apply edits
+    try:
+        arcpy.Snap_edit(out_fc, [[out_fc, "END", snap_tol]])
+        errors.append({"OID": "ALL", "Error": "Dangling ends", "Field": "Shape", "Action": f"Snapped ({snap_tol})"})
+    except Exception as e:
+        errors.append({"OID": "ALL", "Error": f"Snap failed: {e}", "Field": "Shape", "Action": "Unfixed"})
+
+    try:
+        arcpy.TrimLine_edit(out_fc, trim_tol)
+        errors.append({"OID": "ALL", "Error": "Overshoots", "Field": "Shape", "Action": f"Trimmed ({trim_tol})"})
+    except Exception as e:
+        errors.append({"OID": "ALL", "Error": f"Trim failed: {e}", "Field": "Shape", "Action": "Unfixed"})
+
+    try:
+        if boundary_lines:
+            arcpy.ExtendLine_edit(out_fc, extend_tol, boundary_lines)
+            errors.append({"OID": "ALL", "Error": "Undershoots", "Field": "Shape", "Action": f"Extended to boundary ({extend_tol})"})
+        else:
+            arcpy.ExtendLine_edit(out_fc, extend_tol)
+            errors.append({"OID": "ALL", "Error": "Undershoots", "Field": "Shape", "Action": f"Extended ({extend_tol})"})
+    except Exception as e:
+        errors.append({"OID": "ALL", "Error": f"Extend failed: {e}", "Field": "Shape", "Action": "Unfixed"})
+
+    return out_fc, errors
+
+
+# MAIN FUNCTION
+def run_qaqc(input_fc, out_folder, log_format="CSV",
+             snap_tol="100 Meters", trim_tol="100 Meters",
+             extend_tol="100 Meters", boundary_fc=None):
+
+    errors = []
+    geom_type = arcpy.Describe(input_fc).shapeType.upper()
+
+    # Ensure output is a geodatabase
+    if not out_folder.lower().endswith(".gdb"):
+        gdb_path = os.path.join(out_folder, "QAQC_Output.gdb")
+        if not arcpy.Exists(gdb_path):
+            arcpy.CreateFileGDB_management(out_folder, "QAQC_Output.gdb")
+        out_folder = gdb_path
+
+    out_fc = os.path.join(out_folder, f"{os.path.basename(input_fc)}_Corrected")
+
+    if geom_type == "POINT":
+        out_fc, errors = fix_points(input_fc, out_fc, errors, boundary_fc)
+
+    elif geom_type == "POLYLINE":
+        out_fc, errors = fix_lines(input_fc, out_fc, errors, snap_tol, trim_tol, extend_tol, boundary_fc)
+
+    else:
+        arcpy.AddError("Unsupported geometry type.")
+        return
+
+    log_path = write_error_log(errors, out_folder, log_format)
+    arcpy.AddMessage(f"Corrected dataset: {out_fc}")
+    arcpy.AddMessage(f"Error log: {log_path}")
+
+    # Add to map
+    try:
+        aprx = arcpy.mp.ArcGISProject("CURRENT")
+        aprx.listMaps()[0].addDataFromPath(out_fc)
+    except:
+        pass
+
+
+# SCRIPT TOOL ENTRY POINT
+if __name__ == "__main__":
+    input_fc = arcpy.GetParameterAsText(0)
+    out_folder = arcpy.GetParameterAsText(1)
+    log_format = arcpy.GetParameterAsText(2)
+    snap_tol = arcpy.GetParameterAsText(3) or "100 Meters"
+    trim_tol = arcpy.GetParameterAsText(4) or "100 Meters"
+    extend_tol = arcpy.GetParameterAsText(5) or "100 Meters"
+    boundary_fc = arcpy.GetParameterAsText(6) or None
+
+    run_qaqc(input_fc, out_folder, log_format,
+             snap_tol, trim_tol, extend_tol, boundary_fc)
+
